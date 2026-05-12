@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { TableData } from '../types';
 
 interface Props { tables: TableData[]; lastChangedTable?: string; lastChangeType?: string; }

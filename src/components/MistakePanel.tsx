@@ -1,4 +1,3 @@
-import React from 'react';
 import { SqlMistake } from '../types';
 
 interface Props { mistakes: SqlMistake[]; }

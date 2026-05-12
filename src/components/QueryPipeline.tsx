@@ -93,7 +93,7 @@ function GroupByVisual({ step, tables }: { step: VisualStep; tables: TableData[]
   );
 }
 
-function StageCard({ step, tables, index }: { step: VisualStep; index: number; tables: TableData[] }) {
+function StageCard({ step, tables, index: _index }: { step: VisualStep; index: number; tables: TableData[] }) {
   const [open, setOpen] = useState(true);
   return (
     <div className={`stage-card stage-${step.stage}`}>

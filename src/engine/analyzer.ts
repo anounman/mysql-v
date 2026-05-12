@@ -1,157 +1,72 @@
-import express from 'express';
-import cors from 'cors';
-import { createRequire } from 'module';
-import { fileURLToPath } from 'url';
-import path from 'path';
-import fs from 'fs';
+/**
+ * Query analysis & mistake detection — ported from server/index.js.
+ * Generates the visual pipeline steps and SQL beginner error hints.
+ */
+import type { TableData, VisualStep, SqlMistake } from '../types';
+import { getTableData } from './db';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
+// ── Query pipeline analysis ─────────────────────────────────────────────────
 
-// sql.js uses CommonJS, load via require
-const initSqlJs = require('sql.js');
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-let SQL = null;
-let db = null;
-
-async function initDb() {
-  SQL = await initSqlJs();
-  db = new SQL.Database(); // start empty — user creates their own tables
-}
-
-// sql.js query helper — returns {columns, rows}
-function query(sql) {
-  const results = db.exec(sql);
-  if (!results.length) return { columns: [], rows: [] };
-  const { columns, values } = results[0];
-  const rows = values.map(v => {
-    const row = {};
-    columns.forEach((c, i) => row[c] = v[i]);
-    return row;
-  });
-  return { columns, rows };
-}
-
-function run(sql) {
-  db.run(sql);
-  return { changes: db.getRowsModified() };
-}
-
-function getTableNames() {
-  const { rows } = query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-  return rows.map(r => r.name);
-}
-
-function getTableData(name) {
-  try {
-    // PRAGMA table_info works even when table is empty (unlike SELECT * which returns no columns)
-    const { rows: pragmaRows } = query(`PRAGMA table_info("${name}")`);
-    const columns = pragmaRows.map(r => r.name);
-    const { rows } = query(`SELECT * FROM "${name}"`);
-    return { name, columns, rows };
-  } catch(e) { return { name, columns: [], rows: [] }; }
-}
-
-function getAllTables() {
-  return getTableNames().map(getTableData);
-}
-
-// MySQL → SQLite compatibility
-function adaptMySQL(sql) {
-  return sql
-    // Convert MySQL backtick identifiers to SQLite double-quote identifiers
-    .replace(/`([^`]+)`/g, '"$1"')
-    .replace(/\bYEAR\s*\(\s*([^)]+)\s*\)/gi, "CAST(strftime('%Y', $1) AS INTEGER)")
-    .replace(/\bMONTH\s*\(\s*([^)]+)\s*\)/gi, "CAST(strftime('%m', $1) AS INTEGER)")
-    .replace(/\bDAY\s*\(\s*([^)]+)\s*\)/gi, "CAST(strftime('%d', $1) AS INTEGER)")
-    .replace(/\bNOW\s*\(\s*\)/gi, "datetime('now')")
-    .replace(/\bCURDATE\s*\(\s*\)/gi, "date('now')")
-    .replace(/\bIFNULL\s*\(/gi, "COALESCE(")
-    .replace(/AUTO_INCREMENT/gi, "AUTOINCREMENT")
-    .replace(/\bINT\s+PRIMARY\s+KEY\b/gi, "INTEGER PRIMARY KEY")
-    .replace(/\bVARCHAR\s*\(\d+\)/gi, "TEXT")
-    // Remove LIMIT from UPDATE/DELETE — sql.js SQLite not compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT
-    .replace(/(\bUPDATE\b[\s\S]+?)\s+LIMIT\s+\d+\s*;/gi, '$1;')
-    .replace(/(\bDELETE\b[\s\S]+?)\s+LIMIT\s+\d+\s*;/gi, '$1;')
-
-    .replace(/(\s)DATE(\s*(?:,|\)|NOT NULL|DEFAULT|PRIMARY|UNIQUE|CHECK|\s*$))/gi, "$1TEXT$2");
-}
-
-function splitStatements(sql) {
-  const stmts = [];
-  let current = '';
-  let depth = 0;
-  for (let i = 0; i < sql.length; i++) {
-    const ch = sql[i];
-    if (ch === '(') depth++;
-    else if (ch === ')') depth--;
-    if (ch === ';' && depth === 0) {
-      if (current.trim()) stmts.push(current.trim());
-      current = '';
-    } else { current += ch; }
-  }
-  if (current.trim()) stmts.push(current.trim());
-  return stmts;
-}
-
-function analyzeQuery(sql) {
+export function analyzeQuery(sql: string, _tables: TableData[]): { type: string; steps: VisualStep[] } {
   const upper = sql.toUpperCase().trim();
   const type = upper.startsWith('SELECT') ? 'SELECT'
     : upper.startsWith('INSERT') ? 'INSERT'
     : upper.startsWith('UPDATE') ? 'UPDATE'
     : upper.startsWith('DELETE') ? 'DELETE'
-    : upper.startsWith('CREATE') ? 'CREATE' : 'OTHER';
+    : upper.startsWith('CREATE') ? 'CREATE'
+    : upper.startsWith('ALTER')  ? 'ALTER'
+    : upper.startsWith('DROP')   ? 'DROP'
+    : 'OTHER';
 
-  const steps = [];
+  const steps: VisualStep[] = [];
 
   if (type === 'SELECT') {
+    // FROM
     const fromMatch = sql.match(/\bFROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?/i);
     if (fromMatch) {
       const tableName = fromMatch[1];
-      let tableData = { name: tableName, columns: [], rows: [] };
-      try { tableData = getTableData(tableName); } catch(e) {}
+      let tableData: TableData = { name: tableName, columns: [], rows: [] };
+      try { tableData = getTableData(tableName); } catch { /* table might not exist */ }
       steps.push({
         stage: 'FROM',
         title: 'Step 1: FROM — Load base table',
         explanation: `The query starts by loading all rows from "${tableName}". Every row is a candidate at this stage — no filtering has happened yet. Think of it as dumping the whole table onto the work desk.`,
-        tables: [tableData]
+        tables: [tableData],
       });
     }
 
-    const hasSubquery = /\(\s*SELECT/i.test(sql);
-    if (hasSubquery) {
+    // SUBQUERY
+    if (/\(\s*SELECT/i.test(sql)) {
       steps.push({
         stage: 'SUBQUERY',
         title: 'Step 2a: Subquery — Execute inner query first',
-        explanation: `A subquery inside FROM is executed before the outer query. Its result becomes a temporary table (like a virtual table with an alias). The outer query then joins against this result as if it were a real table.`,
-        tables: []
+        explanation: 'A subquery inside FROM is executed before the outer query. Its result becomes a temporary table (virtual table with an alias). The outer query then joins against this result as if it were a real table.',
+        tables: [],
       });
     }
 
+    // JOIN
     const joinMatches = [...sql.matchAll(/\b(LEFT\s+OUTER\s+|LEFT\s+|RIGHT\s+|INNER\s+)?JOIN\s+(?!\s*\()(\w+)\s+(?:AS\s+)?(\w+)?\s+ON\s+([\s\S]+?)(?=\b(?:LEFT|RIGHT|INNER|JOIN|WHERE|GROUP|HAVING|ORDER|LIMIT)\b|$)/gi)];
     if (joinMatches.length || /JOIN\s*\(/i.test(sql)) {
       const joinInfo = joinMatches.map(m => ({
         type: (m[1] || '').trim().toUpperCase().includes('LEFT') ? 'LEFT JOIN' : 'INNER JOIN',
         table: m[2] || '?',
         alias: m[3] || null,
-        condition: (m[4] || '').trim()
+        condition: (m[4] || '').trim(),
       }));
       if (/JOIN\s*\(/i.test(sql)) {
-        joinInfo.push({ type: 'INNER JOIN', table: '(subquery)', alias: 'bank', condition: 'p.id = bank.person AND t.year = bank.year' });
+        joinInfo.push({ type: 'INNER JOIN', table: '(subquery)', alias: null, condition: 'see subquery' });
       }
       steps.push({
         stage: 'JOIN',
-        title: `Step 2: JOIN — Combine matching rows`,
-        explanation: `JOIN combines rows from two tables where the ON condition is TRUE. INNER JOIN: only rows that match appear. LEFT JOIN: all left rows appear; unmatched right rows get NULL. No match = row is discarded (INNER) or NULLed (LEFT).`,
+        title: 'Step 2: JOIN — Combine matching rows',
+        explanation: 'JOIN combines rows from two tables where the ON condition is TRUE. INNER JOIN: only rows that match appear. LEFT JOIN: all left rows appear; unmatched right rows get NULL. No match = row is discarded (INNER) or NULLed (LEFT).',
         joinInfo,
-        tables: []
+        tables: [],
       });
     }
 
+    // WHERE
     if (/\bWHERE\b/i.test(sql)) {
       const whereMatch = sql.match(/\bWHERE\s+([\s\S]+?)(?=\bGROUP\b|\bHAVING\b|\bORDER\b|\bLIMIT\b|$)/i);
       const cond = whereMatch ? whereMatch[1].trim() : '';
@@ -160,22 +75,24 @@ function analyzeQuery(sql) {
         title: 'Step 3: WHERE — Filter rows',
         explanation: `WHERE is applied BEFORE GROUP BY. Each row from the join is tested: "${cond}". Rows where this is FALSE are removed. WHERE cannot use aggregate functions (SUM, COUNT etc.) — use HAVING for that.`,
         condition: cond,
-        tables: []
+        tables: [],
       });
     }
 
+    // GROUP BY
     if (/\bGROUP\s+BY\b/i.test(sql)) {
       const gbMatch = sql.match(/\bGROUP\s+BY\s+([\s\S]+?)(?=\bHAVING\b|\bORDER\b|\bLIMIT\b|$)/i);
       const gb = gbMatch ? gbMatch[1].trim() : '';
       steps.push({
         stage: 'GROUP_BY',
         title: 'Step 4: GROUP BY — Create groups',
-        explanation: `GROUP BY creates "buckets" of rows that share the same values for: ${gb}. All rows within a group are collapsed into one output row. Aggregate functions (SUM, COUNT, AVG, MIN, MAX) compute values across each bucket. Important: you CANNOT select a non-grouped column without an aggregate!`,
+        explanation: `GROUP BY creates "buckets" of rows that share the same values for: ${gb}. All rows within a group are collapsed into one output row. Aggregate functions (SUM, COUNT, AVG, MIN, MAX) compute values across each bucket.`,
         groupByClause: gb,
-        tables: []
+        tables: [],
       });
     }
 
+    // HAVING
     if (/\bHAVING\b/i.test(sql)) {
       const havingMatch = sql.match(/\bHAVING\s+([\s\S]+?)(?=\bORDER\b|\bLIMIT\b|$)/i);
       const cond = havingMatch ? havingMatch[1].trim() : '';
@@ -184,39 +101,43 @@ function analyzeQuery(sql) {
         title: 'Step 5: HAVING — Filter groups',
         explanation: `HAVING filters GROUPS (after GROUP BY), while WHERE filters ROWS (before GROUP BY). Condition: "${cond}". Groups that fail this condition are removed from the output.`,
         condition: cond,
-        tables: []
+        tables: [],
       });
     }
 
+    // SELECT
     const selectMatch = sql.match(/^SELECT\s+([\s\S]+?)\s+FROM/i);
     const cols = selectMatch ? selectMatch[1].trim() : '*';
     steps.push({
       stage: 'SELECT',
       title: 'Step 6: SELECT — Project columns',
-      explanation: `SELECT picks which columns appear in the final output. Aliases (AS) rename columns. Expressions like SUM(income) are evaluated here. This step happens AFTER filtering and grouping — remember, the written order is not the execution order!`,
+      explanation: 'SELECT picks which columns appear in the final output. Aliases (AS) rename columns. Expressions like SUM(income) are evaluated here. This step happens AFTER filtering and grouping — written order ≠ execution order!',
       columns: cols,
-      tables: []
+      tables: [],
     });
 
+    // ORDER BY
     if (/\bORDER\s+BY\b/i.test(sql)) {
       const obMatch = sql.match(/\bORDER\s+BY\s+([\s\S]+?)(?=\bLIMIT\b|$)/i);
       steps.push({
         stage: 'ORDER_BY',
         title: 'Step 7: ORDER BY — Sort results',
         explanation: `ORDER BY sorts the final result. It runs AFTER SELECT, so you can sort by aliases. By: ${obMatch ? obMatch[1].trim() : '?'}`,
-        tables: []
+        tables: [],
       });
     }
 
+    // LIMIT
     if (/\bLIMIT\b/i.test(sql)) {
       const limMatch = sql.match(/\bLIMIT\s+(\d+)/i);
       steps.push({
         stage: 'LIMIT',
         title: 'Step 8: LIMIT — Restrict row count',
         explanation: `LIMIT is the very last step. It truncates the output to ${limMatch ? limMatch[1] : 'N'} rows. Only use it after ORDER BY if you want the top-N specifically.`,
-        tables: []
+        tables: [],
       });
     }
+
   } else if (type === 'INSERT') {
     steps.push({ stage: 'INSERT', title: 'INSERT — Add new row', explanation: 'INSERT adds a new row to the table. The row is appended to the table. If a PRIMARY KEY constraint is violated, the insert fails.', tables: [] });
   } else if (type === 'UPDATE') {
@@ -234,8 +155,10 @@ function analyzeQuery(sql) {
   return { type, steps };
 }
 
-function detectMistakes(sql) {
-  const mistakes = [];
+// ── Mistake detection ────────────────────────────────────────────────────────
+
+export function detectMistakes(sql: string): SqlMistake[] {
+  const mistakes: SqlMistake[] = [];
 
   if (/\bWHERE\b[\s\S]*(SUM|COUNT|AVG|MIN|MAX)\s*\(/i.test(sql)) {
     mistakes.push({ level: 'error', title: 'Aggregate function in WHERE clause', detail: 'You cannot use SUM(), COUNT(), AVG() etc. in WHERE. WHERE filters rows before grouping. Use HAVING to filter after aggregation.' });
@@ -273,64 +196,3 @@ function detectMistakes(sql) {
 
   return mistakes;
 }
-
-// ── ROUTES ──────────────────────────────────────────────────────────────────
-
-app.get('/api/tables', (req, res) => {
-  try { res.json({ tables: getAllTables() }); }
-  catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/run', (req, res) => {
-  const { sql } = req.body;
-  if (!sql) return res.status(400).json({ error: 'No SQL provided' });
-
-  const adapted = adaptMySQL(sql);
-  const stmts = splitStatements(adapted);
-  const originalStmts = splitStatements(sql);
-  const results = [];
-  const errors = [];
-
-  for (let i = 0; i < stmts.length; i++) {
-    const stmt = stmts[i];
-    const upper = stmt.toUpperCase().trim();
-    try {
-      if (upper.startsWith('SELECT')) {
-        const { columns, rows } = query(stmt);
-        results.push({ type: 'SELECT', columns, rows, rowCount: rows.length, sql: stmt });
-      } else {
-        const { changes } = run(stmt);
-        const type = upper.startsWith('INSERT') ? 'INSERT'
-          : upper.startsWith('UPDATE') ? 'UPDATE'
-          : upper.startsWith('DELETE') ? 'DELETE' : 'DDL';
-        results.push({ type, changes, sql: stmt });
-      }
-    } catch(e) {
-      errors.push({ sql: originalStmts[i] || stmt, error: e.message });
-    }
-  }
-
-  const mainStmt = originalStmts.find(s => s.toUpperCase().trim().startsWith('SELECT')) || originalStmts[originalStmts.length - 1] || '';
-  const analysis = analyzeQuery(mainStmt);
-  const mistakes = detectMistakes(mainStmt);
-
-  res.json({ results, errors, tables: getAllTables(), steps: analysis.steps, queryType: analysis.type, mistakes });
-});
-
-app.post('/api/reset', (req, res) => {
-  try {
-    db = new SQL.Database(); // fully empty — drop everything
-    res.json({ success: true, tables: getAllTables() });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/step-analysis', (req, res) => {
-  const { sql } = req.body;
-  if (!sql) return res.status(400).json({ error: 'No SQL provided' });
-  res.json({ steps: analyzeQuery(sql).steps, queryType: analyzeQuery(sql).type, mistakes: detectMistakes(sql) });
-});
-
-const PORT = 3001;
-initDb().then(() => {
-  app.listen(PORT, () => console.log(`\n🗄️  MySQL Visualizer Backend → http://localhost:${PORT}\n`));
-}).catch(e => { console.error('DB init failed:', e); process.exit(1); });

@@ -1,4 +1,3 @@
-import React from 'react';
 import { QueryResult, QueryError, TableData } from '../types';
 
 interface Props {
@@ -7,7 +6,7 @@ interface Props {
   tables: TableData[];
 }
 
-export default function ResultTable({ results, errors, tables }: Props) {
+export default function ResultTable({ results, errors }: Props) {
   return (
     <div className="result-section">
       {errors.map((e, i) => (
