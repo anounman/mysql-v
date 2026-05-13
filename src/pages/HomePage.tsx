@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { Github } from 'lucide-react';
 import {
   getProjects, createProject, deleteProject, Project,
   setActiveProjectId, clearActiveProject,
@@ -70,6 +71,28 @@ export default function HomePage({ onOpenProject }: Props) {
         <div className="home-header-badges">
           <span className="home-badge">🧠 SQLite in Browser</span>
           <span className="home-badge">⚡ No Backend</span>
+          <a 
+            href="https://github.com/anounman/mysql-v" 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="home-badge"
+            style={{ 
+              display: 'flex', alignItems: 'center', gap: '6px', 
+              textDecoration: 'none', color: 'var(--text-primary)', 
+              cursor: 'pointer', transition: 'all 0.2s', border: '1px solid var(--border)' 
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.backgroundColor = 'var(--border)';
+              e.currentTarget.style.transform = 'translateY(-1px)';
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.backgroundColor = 'var(--bg-2)';
+              e.currentTarget.style.transform = 'none';
+            }}
+          >
+            <Github size={14} />
+            View Source Code
+          </a>
         </div>
       </header>
 
@@ -174,8 +197,9 @@ export default function HomePage({ onOpenProject }: Props) {
       </section>
 
       {/* ── Footer ── */}
-      <footer className="home-footer">
-        MySQL Visualizer · SQLite runs 100% in your browser · Data stored locally
+      <footer className="home-footer" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <span>MySQL Visualizer · SQLite runs 100% in your browser · Data stored locally</span>
+        <span>&copy; {new Date().getFullYear()} made by Ankush Das</span>
       </footer>
     </div>
   );
